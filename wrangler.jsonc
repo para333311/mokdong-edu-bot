@@ -1,0 +1,16 @@
+{
+  "name": "mokdong-edu-bot",
+  "main": "src/index.js",
+  "compatibility_date": "2026-01-01",
+  "triggers": {
+    // 매일 07:30 KST / 일요일 20:00 KST
+    "crons": ["30 22 * * *", "0 11 * * sun"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "mokdong-edu-bot-db",
+      "database_id": "00000000-0000-0000-0000-000000000000"
+    }
+  ]
+}
