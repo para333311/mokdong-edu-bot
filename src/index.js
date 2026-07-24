@@ -29,7 +29,7 @@ async function registerWebhook(origin, token) {
 
 export default {
   async scheduled(event, env) {
-    if (event.cron === "30 22 * * *") {
+    if (event.cron === "0 21 * * *" || event.cron === "0 9 * * *") {
       await dailyBrief(env, env.DB);
       return;
     }
