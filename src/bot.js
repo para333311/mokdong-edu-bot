@@ -548,13 +548,18 @@ export async function weeklyBrief(env, db) {
 export async function handleUpdate(env, db, update) {
   await ensureSchema(db);
 
+  // 개인 메시지와 채널 게시물 모두 같은 명령 처리 경로를 사용한다.
+  const isChannel = Boolean(update.channel_post);
+  const msg = update.channel_post || update.message;
+  const text = msg?.text;
+  const chatId = msg?.chat?.id;
+  if (!chatId) return;
+
   // 채널에 글이 올라오면 채널 자동 등록 (봇이 관리자일 때 수신됨)
-  const chPost = update.channel_post;
-  if (chPost?.chat?.id) {
-    const chatId = String(chPost.chat.id);
+  if (isChannel) {
     const { meta } = await db
       .prepare("INSERT OR IGNORE INTO chats (chat_id, kind) VALUES (?, 'channel')")
-      .bind(chatId)
+      .bind(String(chatId))
       .run();
     if (meta.changes > 0) {
       await sendTelegram(
@@ -563,19 +568,18 @@ export async function handleUpdate(env, db, update) {
         "✅ 이 채널이 등록되었습니다!\n매일 아침 7:30 교육·입시 브리핑이 여기로 옵니다.\n(일요일 저녁엔 주간 체크리스트)"
       );
     }
-    return;
   }
 
-  const msg = update.message;
-  const text = msg?.text;
-  const chatId = msg?.chat?.id;
-  if (!text || !chatId) return;
+  // 일반 채널 게시물은 등록만 하고, 명령 게시물은 아래에서 계속 처리한다.
+  if (!text || (isChannel && !text.startsWith("/"))) return;
 
   if (text.startsWith("/start")) {
-    await db
-      .prepare("INSERT OR IGNORE INTO chats (chat_id, kind) VALUES (?, 'private')")
-      .bind(String(chatId))
-      .run();
+    if (!isChannel) {
+      await db
+        .prepare("INSERT OR IGNORE INTO chats (chat_id, kind) VALUES (?, 'private')")
+        .bind(String(chatId))
+        .run();
+    }
     await sendTelegram(
       env,
       chatId,
