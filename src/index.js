@@ -27,15 +27,19 @@ async function registerWebhook(origin, token) {
   return response.json();
 }
 
+/** 주간 체크리스트 cron (일요일 20:00 KST). 나머지 cron은 모두 일일 브리핑. */
+const WEEKLY_CRON = "0 11 * * sun";
+
 export default {
   async scheduled(event, env) {
-    if (event.cron === "0 21 * * *" || event.cron === "0 9 * * *") {
-      await dailyBrief(env, env.DB);
+    // cron 문자열을 일일이 나열해 비교하면 wrangler.jsonc의 시간을 바꿨을 때
+    // 해당 실행이 아무 일도 하지 않고 조용히 끝난다. 주간 cron만 구분하고
+    // 나머지는 전부 일일 브리핑으로 처리한다.
+    if (event.cron === WEEKLY_CRON) {
+      await weeklyBrief(env, env.DB);
       return;
     }
-    if (event.cron === "0 11 * * sun") {
-      await weeklyBrief(env, env.DB);
-    }
+    await dailyBrief(env, env.DB);
   },
 
   async fetch(request, env, ctx) {

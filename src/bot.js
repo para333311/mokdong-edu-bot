@@ -14,6 +14,24 @@
 const DEDUP_DAYS = 7;
 const MAX_PER_SECTION = 3;
 
+/**
+ * 오후 브리핑이 비지 않도록 후보를 깊게 받는다.
+ * 오전 실행이 상위 항목을 이미 "본 것"으로 표시하므로, 후보가 얕으면
+ * 오후에는 남는 항목이 없어 브리핑이 통째로 사라진다.
+ */
+const NEWS_POOL = 30;
+/** Bing 폴백 시 섭션당 검색 키워드 수 (서브리퀘스트 한도 대응) */
+const MAX_BING_QUERIES = 3;
+/**
+ * 브리핑 1회당 og:image 조회 횟수 상한.
+ * Workers 무료 플랜은 실행당 서브리퀘스트 50개가 한도라서, 이미지 조회가
+ * 늘어나면 정작 중요한 텔레그램 전송이 한도에 걸려 중간에 끊긴다.
+ */
+const MAX_OG_FETCH = 4;
+/** 외부 소스가 응답하지 않을 때 실행 전체가 멈추지 않도록 하는 타임아웃(ms) */
+const FEED_TIMEOUT_MS = 10000;
+const OG_TIMEOUT_MS = 8000;
+
 const UA = {
   "User-Agent":
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -121,9 +139,9 @@ async function fetchGoogleNews(query, window = "2d") {
     "https://news.google.com/rss/search?q=" +
     encodeURIComponent(query + ` when:${window}`) +
     "&hl=ko&gl=KR&ceid=KR:ko";
-  const r = await fetch(url, { headers: UA });
+  const r = await fetch(url, { headers: UA, signal: AbortSignal.timeout(FEED_TIMEOUT_MS) });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
-  return parseRss(await r.text());
+  return parseRss(await r.text(), NEWS_POOL);
 }
 
 /** Bing 뉴스 리다이렉트 링크에서 원본 기사 URL 추출 */
@@ -146,7 +164,7 @@ async function fetchBingNews(sec) {
   const interval = parseInt(sec.window || "2") >= 8 ? "9" : "8";
   const merged = [];
   const seen = new Set();
-  for (const kw of sec.bing || []) {
+  for (const kw of (sec.bing || []).slice(0, MAX_BING_QUERIES)) {
     try {
       // 단일 단어는 따옴표(정확도↑), 복합 키워드는 그대로(결과수↑)
       const q = kw.includes(" ") ? kw : `"${kw}"`;
@@ -154,9 +172,12 @@ async function fetchBingNews(sec) {
         "https://www.bing.com/news/search?q=" +
         encodeURIComponent(q) +
         `&format=RSS&mkt=ko-KR&qft=interval%3d%22${interval}%22`;
-      const r = await fetch(url, { headers: UA });
+      const r = await fetch(url, {
+        headers: UA,
+        signal: AbortSignal.timeout(FEED_TIMEOUT_MS),
+      });
       if (!r.ok) continue;
-      for (const it of parseRss(await r.text(), 10)) {
+      for (const it of parseRss(await r.text(), 15)) {
         const k = it.title.replace(/\s+/g, "").slice(0, 60);
         if (seen.has(k)) continue;
         seen.add(k);
@@ -183,6 +204,7 @@ async function fetchNews(sec) {
 async function fetchVeritas() {
   const r = await fetch("http://www.veritas-a.com/rss/allArticle.xml", {
     headers: UA,
+    signal: AbortSignal.timeout(FEED_TIMEOUT_MS),
   });
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const items = parseRss(await r.text(), 30);
@@ -196,7 +218,7 @@ async function fetchVeritas() {
 async function fetchYouTube(channel) {
   const r = await fetch(
     `https://www.youtube.com/feeds/videos.xml?channel_id=${channel.id}`,
-    { headers: UA }
+    { headers: UA, signal: AbortSignal.timeout(FEED_TIMEOUT_MS) }
   );
   if (!r.ok) throw new Error(`HTTP ${r.status}`);
   const xml = await r.text();
@@ -365,7 +387,11 @@ export function formatSection(sec) {
 async function fetchOgImage(url) {
   try {
     if (!url || url.includes("news.google.com")) return null; // 구글 리다이렉트는 이미지 추출 불가
-    const r = await fetch(url, { headers: UA, redirect: "follow" });
+    const r = await fetch(url, {
+      headers: UA,
+      redirect: "follow",
+      signal: AbortSignal.timeout(OG_TIMEOUT_MS),
+    });
     if (!r.ok) return null;
     const html = (await r.text()).slice(0, 150000);
     const m =
@@ -383,24 +409,44 @@ async function fetchOgImage(url) {
 export async function buildBriefCards(fresh) {
   const order = ["policy", "highschool", "mokdong", "seminar", "veritas", "youtube"];
   const cards = [];
+  let ogLeft = MAX_OG_FETCH; // 실행당 이미지 조회 예산 (텔레그램 전송분을 남겨둔다)
   for (const key of order) {
     const sec = fresh[key];
     if (!sec || !sec.items.length) continue;
     let photo = null;
     if (key === "youtube") {
-      // 유튜브는 썸네일 URL을 바로 만들 수 있음
+      // 유튜브는 썸네일 URL을 바로 만들 수 있음 (서브리퀘스트 없음)
       const vm = sec.items[0]?.link?.match(/[?&]v=([\w-]{11})/);
       if (vm) photo = `https://i.ytimg.com/vi/${vm[1]}/hqdefault.jpg`;
-    } else {
-      // 앞의 두 기사에서만 이미지 시도 (서브리퀘스트 절약)
-      for (const it of sec.items.slice(0, 2)) {
-        photo = await fetchOgImage(it.link);
-        if (photo) break;
-      }
+    } else if (ogLeft > 0) {
+      // 대표 기사 하나만 시도. 이미지는 있으면 좋은 것일 뿐이라
+      // 브리핑 전송 자체를 위협할 만큼 예산을 쓰지 않는다.
+      ogLeft -= 1;
+      photo = await fetchOgImage(sec.items[0].link);
     }
     cards.push({ label: sec.label, html: formatSection(sec), photo, firstLink: sec.items[0]?.link || "" });
   }
   return cards;
+}
+
+/**
+ * 새 항목이 하나도 없을 때 보내는 알림.
+ * 예전에는 조용히 아무것도 보내지 않아서, 오후 6시 브리핑이 "봇이 멈춘 것"과
+ * 구분되지 않았다. 수집 실패한 소스가 있으면 함께 알려 원인을 바로 알 수 있게 한다.
+ */
+export function formatNoNews(status) {
+  const failed = Object.entries(status || {})
+    .filter(([, v]) => String(v).startsWith("❌"))
+    .map(([k, v]) => `• ${k}: ${v}`);
+  const lines = [
+    `🎓 <b>목동 교육·입시 브리핑</b> — ${kstDate()}`,
+    "",
+    "😴 지난 브리핑 이후 새로 올라온 소식이 없습니다.",
+  ];
+  if (failed.length) {
+    lines.push("", "<b>⚠️ 수집 실패 소스</b>", ...failed.map(escHtml));
+  }
+  return lines.join("\n");
 }
 
 export function formatWeekly() {
@@ -472,7 +518,13 @@ export async function sendTelegram(env, chatId, text, html = false) {
 
 async function broadcast(env, db, text, html = false) {
   const chats = (await db.prepare("SELECT chat_id FROM chats").all()).results;
-  for (const c of chats) await sendTelegram(env, c.chat_id, text, html);
+  for (const c of chats) {
+    try {
+      await sendTelegram(env, c.chat_id, text, html);
+    } catch (e) {
+      console.log(`전송 실패 chat=${c.chat_id}: ${e.message}`);
+    }
+  }
   return chats.length;
 }
 
@@ -520,7 +572,14 @@ async function sendBriefTo(env, chatId, cards) {
     `🎓 <b>목동 교육·입시 브리핑</b> — ${kstDate()}`,
     true
   );
-  for (const card of cards) await sendCard(env, chatId, card);
+  for (const card of cards) {
+    // 카드 하나가 실패해도 나머지 카드는 계속 보낸다.
+    try {
+      await sendCard(env, chatId, card);
+    } catch (e) {
+      console.log(`카드 전송 실패 (${card.label}): ${e.message}`);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -530,12 +589,19 @@ async function sendBriefTo(env, chatId, cards) {
 /** 매일 오전·오후 브리핑 */
 export async function dailyBrief(env, db) {
   await ensureSchema(db);
-  const { sections } = await collect();
+  const { sections, status } = await collect();
   const fresh = await filterNewItems(db, sections);
   const cards = await buildBriefCards(fresh);
-  if (!cards.length) return;
   const chats = (await db.prepare("SELECT chat_id FROM chats").all()).results;
-  for (const c of chats) await sendBriefTo(env, c.chat_id, cards);
+  for (const c of chats) {
+    // 한 채팅에서 실패해도 나머지 채팅 전송은 계속한다.
+    try {
+      if (cards.length) await sendBriefTo(env, c.chat_id, cards);
+      else await sendTelegram(env, c.chat_id, formatNoNews(status), true);
+    } catch (e) {
+      console.log(`브리핑 전송 실패 chat=${c.chat_id}: ${e.message}`);
+    }
+  }
 }
 
 /** 일요일 저녁 주간 체크리스트 */
@@ -594,11 +660,11 @@ export async function handleUpdate(env, db, update) {
     await db.prepare("DELETE FROM chats WHERE chat_id = ?").bind(String(chatId)).run();
     await sendTelegram(env, chatId, "🛑 알림 중지. 다시 받으려면 /start");
   } else if (text.startsWith("/brief")) {
-    const { sections } = await collect();
+    const { sections, status } = await collect();
     const fresh = await filterNewItems(db, sections);
     const cards = await buildBriefCards(fresh);
     if (cards.length) await sendBriefTo(env, chatId, cards);
-    else await sendTelegram(env, chatId, "😴 지난 브리핑 이후 새 소식이 없습니다.");
+    else await sendTelegram(env, chatId, formatNoNews(status), true);
   } else if (text.startsWith("/status")) {
     const { status } = await collect();
     const lines = ["🔧 수집 소스 상태"];
